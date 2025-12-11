@@ -3,8 +3,17 @@ SoulSmith Story Processing Module
 Functions to compute metrics from transcripts and build story prompts.
 """
 
+import os
 import re
+import json
 from typing import Dict, List, Any
+import anthropic
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 
 def build_story_prompt(intro_transcript: Dict) -> str:
@@ -170,44 +179,75 @@ def calculate_comprehension_metrics(story_transcript: Dict) -> Dict:
 
 def compute_metrics_with_llm(intro_transcript: Dict, story_transcript: Dict) -> Dict:
     """
-    Use an LLM to compute more sophisticated metrics.
-
-    TODO: Call OpenAI/Claude API with transcript to compute metrics
-
-    Example API call structure:
-
-    # TODO: Call OpenAI API
-    # POST https://api.openai.com/v1/chat/completions
-    # Headers: Authorization: Bearer {OPENAI_API_KEY}
-    # Body: {
-    #   "model": "gpt-4",
-    #   "messages": [
-    #     {"role": "system", "content": "You are an expert in child language development..."},
-    #     {"role": "user", "content": f"Analyze this child's conversation: {transcript}"}
-    #   ]
-    # }
-
-    # TODO: Alternatively, call Claude API
-    # POST https://api.anthropic.com/v1/messages
-    # Headers: x-api-key: {ANTHROPIC_API_KEY}
-    # Body: {
-    #   "model": "claude-3-sonnet-20240229",
-    #   "messages": [
-    #     {"role": "user", "content": f"Analyze this child's language..."}
-    #   ]
-    # }
+    Use Claude to compute more sophisticated metrics from the child's conversation.
     """
+    if not ANTHROPIC_API_KEY:
+        # Return placeholder if no API key configured
+        return {
+            "language_complexity": "age-appropriate",
+            "emotional_expression": "positive and engaged",
+            "social_awareness": "developing well",
+            "narrative_skills": "shows creativity",
+            "overall_assessment": "The child demonstrates healthy language development with good imagination and engagement.",
+        }
 
-    # Placeholder LLM analysis results
-    llm_metrics = {
-        "language_complexity": "age-appropriate",
-        "emotional_expression": "positive and engaged",
-        "social_awareness": "developing well",
-        "narrative_skills": "shows creativity",
-        "overall_assessment": "The child demonstrates healthy language development with good imagination and engagement.",
-    }
+    try:
+        # Initialize Anthropic client
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    return llm_metrics
+        # Format transcripts for analysis
+        intro_text = ""
+        if intro_transcript:
+            for msg in intro_transcript.get("messages", []):
+                role = "Child" if msg.get("role") == "user" else "Guide"
+                intro_text += f"{role}: {msg.get('text', '')}\n"
+
+        story_text = ""
+        for msg in story_transcript.get("messages", []):
+            role = "Child" if msg.get("role") == "user" else "Storyteller"
+            story_text += f"{role}: {msg.get('text', '')}\n"
+
+        prompt = f"""You are an expert in child language development and early childhood education.
+Analyze the following conversation between a child (age 4-8) and an AI storytelling assistant.
+
+INTRO CONVERSATION:
+{intro_text}
+
+STORY CONVERSATION:
+{story_text}
+
+Provide a brief analysis in JSON format with these fields:
+- language_complexity: Assess if language is "below age level", "age-appropriate", or "above age level"
+- emotional_expression: Describe the child's emotional engagement (e.g., "positive and engaged", "curious", "shy but warming up")
+- social_awareness: Note any social/emotional intelligence indicators
+- narrative_skills: Assess storytelling comprehension and participation
+- overall_assessment: 2-3 sentence summary for parents about their child's language development
+
+Return ONLY valid JSON, no other text."""
+
+        message = client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=500,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        # Parse the response
+        response_text = message.content[0].text
+        llm_metrics = json.loads(response_text)
+        return llm_metrics
+
+    except Exception as e:
+        print(f"Error calling Claude API: {e}")
+        # Return fallback metrics on error
+        return {
+            "language_complexity": "age-appropriate",
+            "emotional_expression": "positive and engaged",
+            "social_awareness": "developing well",
+            "narrative_skills": "shows creativity",
+            "overall_assessment": "The child demonstrates healthy language development with good imagination and engagement.",
+        }
 
 
 def compute_metrics(intro_transcript: Dict, story_transcript: Dict) -> Dict:

@@ -8,13 +8,22 @@ import os
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from elevenlabs import ElevenLabs
 from story_processing import compute_metrics, build_story_prompt
 
 # Load environment variables from .env file
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type"]}})
+
+# Configuration - Loaded from .env file
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+INTRO_AGENT_ID = os.getenv("INTRO_AGENT_ID")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+# Initialize ElevenLabs client
+elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 # In-memory storage for session data (no persistent DB)
 session_data = {
@@ -25,10 +34,8 @@ session_data = {
     "story_transcript": None,
 }
 
-# Configuration - Loaded from .env file
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-INTRO_AGENT_ID = os.getenv("INTRO_AGENT_ID")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+# Default voice ID for story agent (Rachel - friendly female voice)
+DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 
 
 @app.route("/start_intro", methods=["POST"])
@@ -37,29 +44,45 @@ def start_intro():
     Start the intro agent session.
     Returns WebRTC config for the frontend to connect.
     """
-    # TODO: Call ElevenLabs "GET AGENT" API for the intro agent
-    # GET https://api.elevenlabs.io/v1/convai/agents/{INTRO_AGENT_ID}
-    # Headers: xi-api-key: {ELEVENLABS_API_KEY}
+    try:
+        # Verify the intro agent exists
+        agent = elevenlabs_client.conversational_ai.agents.get(agent_id=INTRO_AGENT_ID)
+        print(f"Found intro agent: {agent.name}")
 
-    # TODO: Call ElevenLabs "GET WEBRTC" API to start voice session
-    # POST https://api.elevenlabs.io/v1/convai/conversation/get_signed_url
-    # Headers: xi-api-key: {ELEVENLABS_API_KEY}
-    # Body: { "agent_id": INTRO_AGENT_ID }
+        # Get WebRTC token for connection
+        webrtc_response = elevenlabs_client.conversational_ai.conversations.get_webrtc_token(
+            agent_id=INTRO_AGENT_ID
+        )
 
-    # Placeholder response structure
-    webrtc_config = {
-        "signed_url": "wss://placeholder.elevenlabs.io/...",
-        "conversation_id": "placeholder_conversation_id",
-    }
+        webrtc_config = {
+            "token": webrtc_response.token,
+        }
 
-    # Store conversation ID for later transcript retrieval
-    session_data["intro_conversation_id"] = webrtc_config.get("conversation_id")
+        return jsonify({
+            "success": True,
+            "webrtc_config": webrtc_config,
+            "agent_id": INTRO_AGENT_ID,
+        })
 
-    return jsonify({
-        "success": True,
-        "webrtc_config": webrtc_config,
-        "agent_id": INTRO_AGENT_ID,
-    })
+    except Exception as e:
+        print(f"Error starting intro: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/set_intro_conversation_id", methods=["POST"])
+def set_intro_conversation_id():
+    """
+    Store the conversation ID after WebRTC connection is established.
+    Called by frontend once connected.
+    """
+    data = request.get_json()
+    conversation_id = data.get("conversation_id")
+
+    if not conversation_id:
+        return jsonify({"success": False, "error": "No conversation_id provided"}), 400
+
+    session_data["intro_conversation_id"] = conversation_id
+    return jsonify({"success": True})
 
 
 @app.route("/get_intro_transcript", methods=["GET"])
@@ -72,28 +95,37 @@ def get_intro_transcript():
     if not conversation_id:
         return jsonify({"success": False, "error": "No intro conversation found"}), 400
 
-    # TODO: Call ElevenLabs "GET CONVERSATION" API
-    # GET https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}
-    # Headers: xi-api-key: {ELEVENLABS_API_KEY}
+    try:
+        # Get conversation details including transcript
+        conversation = elevenlabs_client.conversational_ai.conversations.get(
+            conversation_id=conversation_id
+        )
 
-    # Placeholder transcript structure
-    transcript = {
-        "conversation_id": conversation_id,
-        "messages": [
-            {"role": "agent", "text": "Hi! What's your name?"},
-            {"role": "user", "text": "My name is Emma!"},
-            {"role": "agent", "text": "Nice to meet you Emma! What kind of adventure do you want today?"},
-            {"role": "user", "text": "I want to go to a magical forest with unicorns!"},
-        ]
-    }
+        # Format transcript from conversation
+        messages = []
+        if conversation.transcript:
+            for entry in conversation.transcript:
+                messages.append({
+                    "role": entry.role,
+                    "text": entry.message
+                })
 
-    # Store transcript for story generation
-    session_data["intro_transcript"] = transcript
+        transcript = {
+            "conversation_id": conversation_id,
+            "messages": messages
+        }
 
-    return jsonify({
-        "success": True,
-        "transcript": transcript,
-    })
+        # Store transcript for story generation
+        session_data["intro_transcript"] = transcript
+
+        return jsonify({
+            "success": True,
+            "transcript": transcript,
+        })
+
+    except Exception as e:
+        print(f"Error getting intro transcript: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/create_story_agent", methods=["POST"])
@@ -110,34 +142,35 @@ def create_story_agent():
     # Build custom story prompt from transcript
     story_prompt = build_story_prompt(transcript)
 
-    # TODO: Call ElevenLabs "CREATE AGENT" API with the custom story prompt
-    # POST https://api.elevenlabs.io/v1/convai/agents/create
-    # Headers: xi-api-key: {ELEVENLABS_API_KEY}
-    # Body: {
-    #   "name": "SoulSmith Story Agent",
-    #   "conversation_config": {
-    #     "agent": {
-    #       "prompt": {
-    #         "prompt": story_prompt
-    #       },
-    #       "first_message": "Once upon a time...",
-    #       "language": "en"
-    #     },
-    #     "tts": {
-    #       "voice_id": "YOUR_VOICE_ID"
-    #     }
-    #   }
-    # }
+    try:
+        # Create a new agent with the personalized story prompt
+        new_agent = elevenlabs_client.conversational_ai.agents.create(
+            name=f"SoulSmith Story Agent",
+            conversation_config={
+                "agent": {
+                    "prompt": {
+                        "prompt": story_prompt
+                    },
+                    "first_message": "Once upon a time, in a land not so far away...",
+                    "language": "en"
+                },
+                "tts": {
+                    "voice_id": DEFAULT_VOICE_ID
+                }
+            }
+        )
 
-    # Placeholder new agent ID
-    new_agent_id = "placeholder_story_agent_id"
-    session_data["story_agent_id"] = new_agent_id
+        session_data["story_agent_id"] = new_agent.agent_id
 
-    return jsonify({
-        "success": True,
-        "story_agent_id": new_agent_id,
-        "prompt_preview": story_prompt[:200] + "...",
-    })
+        return jsonify({
+            "success": True,
+            "story_agent_id": new_agent.agent_id,
+            "prompt_preview": story_prompt[:200] + "...",
+        })
+
+    except Exception as e:
+        print(f"Error creating story agent: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/start_story", methods=["POST"])
@@ -151,24 +184,41 @@ def start_story():
     if not story_agent_id:
         return jsonify({"success": False, "error": "No story agent created"}), 400
 
-    # TODO: Call ElevenLabs "GET WEBRTC" API for this new story agent
-    # POST https://api.elevenlabs.io/v1/convai/conversation/get_signed_url
-    # Headers: xi-api-key: {ELEVENLABS_API_KEY}
-    # Body: { "agent_id": story_agent_id }
+    try:
+        # Get WebRTC token for connection
+        webrtc_response = elevenlabs_client.conversational_ai.conversations.get_webrtc_token(
+            agent_id=story_agent_id
+        )
 
-    # Placeholder response structure
-    webrtc_config = {
-        "signed_url": "wss://placeholder.elevenlabs.io/...",
-        "conversation_id": "placeholder_story_conversation_id",
-    }
+        webrtc_config = {
+            "token": webrtc_response.token,
+        }
 
-    session_data["story_conversation_id"] = webrtc_config.get("conversation_id")
+        return jsonify({
+            "success": True,
+            "webrtc_config": webrtc_config,
+            "agent_id": story_agent_id,
+        })
 
-    return jsonify({
-        "success": True,
-        "webrtc_config": webrtc_config,
-        "agent_id": story_agent_id,
-    })
+    except Exception as e:
+        print(f"Error starting story: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/set_story_conversation_id", methods=["POST"])
+def set_story_conversation_id():
+    """
+    Store the story conversation ID after WebRTC connection is established.
+    Called by frontend once connected.
+    """
+    data = request.get_json()
+    conversation_id = data.get("conversation_id")
+
+    if not conversation_id:
+        return jsonify({"success": False, "error": "No conversation_id provided"}), 400
+
+    session_data["story_conversation_id"] = conversation_id
+    return jsonify({"success": True})
 
 
 @app.route("/get_story_transcript", methods=["GET"])
@@ -181,27 +231,36 @@ def get_story_transcript():
     if not conversation_id:
         return jsonify({"success": False, "error": "No story conversation found"}), 400
 
-    # TODO: Call ElevenLabs "GET CONVERSATION" API for story session
-    # GET https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}
-    # Headers: xi-api-key: {ELEVENLABS_API_KEY}
+    try:
+        # Get conversation details including transcript
+        conversation = elevenlabs_client.conversational_ai.conversations.get(
+            conversation_id=conversation_id
+        )
 
-    # Placeholder transcript structure
-    transcript = {
-        "conversation_id": conversation_id,
-        "messages": [
-            {"role": "agent", "text": "Once upon a time, in a magical forest..."},
-            {"role": "user", "text": "What happened next?"},
-            {"role": "agent", "text": "A beautiful unicorn appeared!"},
-            {"role": "user", "text": "Wow! Was it friendly?"},
-        ]
-    }
+        # Format transcript from conversation
+        messages = []
+        if conversation.transcript:
+            for entry in conversation.transcript:
+                messages.append({
+                    "role": entry.role,
+                    "text": entry.message
+                })
 
-    session_data["story_transcript"] = transcript
+        transcript = {
+            "conversation_id": conversation_id,
+            "messages": messages
+        }
 
-    return jsonify({
-        "success": True,
-        "transcript": transcript,
-    })
+        session_data["story_transcript"] = transcript
+
+        return jsonify({
+            "success": True,
+            "transcript": transcript,
+        })
+
+    except Exception as e:
+        print(f"Error getting story transcript: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/metrics", methods=["GET"])
@@ -230,6 +289,16 @@ def reset_session():
     Reset all session data for a new adventure.
     """
     global session_data
+
+    # Optionally delete the dynamically created story agent
+    story_agent_id = session_data.get("story_agent_id")
+    if story_agent_id:
+        try:
+            elevenlabs_client.conversational_ai.agents.delete(agent_id=story_agent_id)
+            print(f"Deleted story agent: {story_agent_id}")
+        except Exception as e:
+            print(f"Error deleting story agent: {e}")
+
     session_data = {
         "intro_conversation_id": None,
         "story_agent_id": None,
@@ -243,10 +312,16 @@ def reset_session():
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint."""
-    return jsonify({"status": "healthy", "app": "SoulSmith"})
+    return jsonify({
+        "status": "healthy",
+        "app": "SoulSmith",
+        "elevenlabs_configured": bool(ELEVENLABS_API_KEY),
+        "intro_agent_configured": bool(INTRO_AGENT_ID),
+    })
 
 
 if __name__ == "__main__":
     print("Starting SoulSmith server...")
-    print("Make sure to set ELEVENLABS_API_KEY and INTRO_AGENT_ID")
+    print(f"ElevenLabs API Key: {'configured' if ELEVENLABS_API_KEY else 'MISSING'}")
+    print(f"Intro Agent ID: {'configured' if INTRO_AGENT_ID else 'MISSING'}")
     app.run(debug=True, port=5000)
