@@ -7,21 +7,21 @@ This document explains the complete flow of the SoulSmith application, including
 ## Architecture Overview
 
 ```
-┌─────────────────┐     HTTP/JSON      ┌─────────────────┐     SDK Calls     ┌─────────────────┐
+┌─────────────────┐     HTTP/JSON      ┌─────────────────┐    HTTP REST     ┌─────────────────┐
 │                 │ ◄───────────────► │                 │ ◄───────────────► │                 │
 │    Frontend     │                    │  Flask Backend  │                    │   ElevenLabs    │
-│   (Browser)     │                    │   (Python)      │                    │      API        │
-│                 │ ◄───────────────► │                 │                    │                 │
-└─────────────────┘     WebSocket      └─────────────────┘                    └─────────────────┘
-        │                                      │
-        │                                      │ SDK Calls
-        │                                      ▼
-        │                              ┌─────────────────┐
-        │         WebSocket            │                 │
-        └─────────────────────────────►│   ElevenLabs    │
-                 (Audio)               │   Convai WS     │
-                                       │                 │
-                                       └─────────────────┘
+│   (Browser)     │                    │   (Python)      │                    │    REST API     │
+│                 │                    │                 │                    │                 │
+└─────────────────┘                    └─────────────────┘                    └─────────────────┘
+        │                                                                            │
+        │                                                                            │
+        │                              WebSocket (signed URL)                        │
+        └───────────────────────────────────────────────────────────────────────────►│
+                         Audio I/O (PCM binary + JSON messages)                      │
+                                                                     ┌─────────────────┐
+                                                                     │   ElevenLabs    │
+                                                                     │   Convai WS     │
+                                                                     └─────────────────┘
 ```
 
 ---
@@ -30,10 +30,10 @@ This document explains the complete flow of the SoulSmith application, including
 
 ### Phase 1: Welcome Screen
 
-**User Action:** Opens app at `http://localhost:8080`
+**User Action:** Opens app at `http://localhost:5000`
 
 **What Happens:**
-1. Browser loads `index.html`, `styles.css`, `app.js`
+1. Flask serves `index.html`, `styles.css`, `app.js` from the `/frontend` directory
 2. JavaScript initializes, shows welcome screen
 3. App waits for user to click "Start Adventure"
 
@@ -51,20 +51,22 @@ startIntroSession()
 
 **Backend (server.py) - `/start_intro`:**
 ```python
-# 1. Verify intro agent exists
-agent = elevenlabs_client.conversational_ai.agents.get(
-    agent_id=INTRO_AGENT_ID
+# 1. Verify intro agent exists (optional)
+agent_resp = requests.get(
+    f"{ELEVENLABS_BASE_URL}/convai/agents/{INTRO_AGENT_ID}",
+    headers=elevenlabs_headers()
 )
 
-# 2. Get WebRTC token for connection
-webrtc_response = elevenlabs_client.conversational_ai.conversations.get_webrtc_token(
-    agent_id=INTRO_AGENT_ID
+# 2. Get signed URL for WebSocket connection
+token_resp = requests.get(
+    f"{ELEVENLABS_BASE_URL}/convai/conversation/get_signed_url?agent_id={INTRO_AGENT_ID}",
+    headers=elevenlabs_headers()
 )
 
-# 3. Return token to frontend
+# 3. Return signed URL to frontend
 return {
     "success": True,
-    "webrtc_config": {"token": webrtc_response.token},
+    "webrtc_config": {"signed_url": token_data.get("signed_url")},
     "agent_id": INTRO_AGENT_ID
 }
 ```
@@ -72,14 +74,14 @@ return {
 **ElevenLabs API Calls:**
 | Call | Method | Endpoint |
 |------|--------|----------|
-| Get Agent | SDK | `agents.get(agent_id)` |
-| Get WebRTC Token | SDK | `conversations.get_webrtc_token(agent_id)` |
+| Get Agent | GET | `/v1/convai/agents/{agent_id}` |
+| Get Signed URL | GET | `/v1/convai/conversation/get_signed_url?agent_id={agent_id}` |
 
 **Frontend receives response, then:**
 ```javascript
-connectToElevenLabs(token, onConversationId, ...)
+connectToElevenLabs(signed_url, onConversationId, ...)
 └── navigator.mediaDevices.getUserMedia({audio: true})  // Get microphone
-└── new WebSocket(`wss://api.elevenlabs.io/v1/convai/conversation?token=${token}`)
+└── new WebSocket(signed_url)  // Connect using signed URL
 └── startAudioCapture()  // Begin sending audio to ElevenLabs
 ```
 
@@ -87,11 +89,11 @@ connectToElevenLabs(token, onConversationId, ...)
 ```
 Browser ◄──── WebSocket ────► ElevenLabs Convai Server
          │
-         ├── Sends: Audio chunks (base64 encoded PCM)
-         ├── Receives: conversation_initiation_metadata (with conversation_id)
-         ├── Receives: audio (agent voice, base64)
-         ├── Receives: user_transcript (what child said)
-         └── Receives: agent_response (what agent said)
+         ├── Sends: JSON {type: "audio", audio: base64_pcm_data}
+         ├── Receives: JSON conversation_initiation_metadata (with conversation_id)
+         ├── Receives: Binary PCM audio (agent voice) OR JSON {type: "audio", audio: base64}
+         ├── Receives: JSON user_transcript (what child said)
+         └── Receives: JSON agent_response (what agent said)
 ```
 
 **When conversation_id is received:**
@@ -125,10 +127,10 @@ Child's Voice
 Microphone (getUserMedia)
      │
      ▼
-AudioContext (ScriptProcessor)
+AudioContext (ScriptProcessor @ 16kHz)
      │
      ▼
-Float32 → Int16 conversion
+Float32 → Int16 PCM conversion
      │
      ▼
 Base64 encoding
@@ -140,10 +142,13 @@ WebSocket send: {type: "audio", audio: base64Data}
 ElevenLabs STT → LLM → TTS
      │
      ▼
-WebSocket receive: {type: "audio", audio: base64AgentVoice}
+WebSocket receive: Binary PCM data (16-bit @ 16kHz)
      │
      ▼
-Base64 decode → AudioBuffer
+Int16 PCM → Float32 conversion
+     │
+     ▼
+Audio queue → Web Audio API playback
      │
      ▼
 Play through speakers
@@ -171,16 +176,18 @@ endIntroSession()
 conversation_id = session_data["intro_conversation_id"]
 
 # 2. Fetch conversation with transcript from ElevenLabs
-conversation = elevenlabs_client.conversational_ai.conversations.get(
-    conversation_id=conversation_id
+conv_resp = requests.get(
+    f"{ELEVENLABS_BASE_URL}/convai/conversations/{conversation_id}",
+    headers=elevenlabs_headers()
 )
+conv_data = conv_resp.json()
 
 # 3. Format transcript
 messages = []
-for entry in conversation.transcript:
+for entry in conv_data.get("transcript", []):
     messages.append({
-        "role": entry.role,      # "agent" or "user"
-        "text": entry.message
+        "role": entry.get("role"),      # "agent" or "user"
+        "text": entry.get("message")
     })
 
 # 4. Store and return
@@ -191,7 +198,7 @@ return {"success": True, "transcript": transcript}
 **ElevenLabs API Call:**
 | Call | Method | Endpoint |
 |------|--------|----------|
-| Get Conversation | SDK | `conversations.get(conversation_id)` |
+| Get Conversation | GET | `/v1/convai/conversations/{conversation_id}` |
 
 **Example Transcript Response:**
 ```json
@@ -255,29 +262,32 @@ Begin with "Once upon a time..." and make it magical!
 **Backend continues:**
 ```python
 # 3. Create new agent on ElevenLabs with this prompt
-new_agent = elevenlabs_client.conversational_ai.agents.create(
-    name="SoulSmith Story Agent",
-    conversation_config={
-        "agent": {
-            "prompt": {"prompt": story_prompt},
-            "first_message": "Once upon a time, in a land not so far away...",
-            "language": "en"
-        },
-        "tts": {
-            "voice_id": "21m00Tcm4TlvDq8ikWAM"  # Rachel voice
+create_resp = requests.post(
+    f"{ELEVENLABS_BASE_URL}/convai/agents/create",
+    headers=elevenlabs_headers(),
+    json={
+        "name": "SoulSmith Story Agent",
+        "conversation_config": {
+            "agent": {
+                "prompt": {"prompt": story_prompt},
+                "first_message": "Once upon a time, in a land not so far away...",
+                "language": "en"
+            },
+            "tts": {"voice_id": "21m00Tcm4TlvDq8ikWAM"}  # Default voice
         }
     }
 )
+agent_data = create_resp.json()
 
 # 4. Store and return agent ID
-session_data["story_agent_id"] = new_agent.agent_id
-return {"success": True, "story_agent_id": new_agent.agent_id}
+session_data["story_agent_id"] = agent_data.get("agent_id")
+return {"success": True, "story_agent_id": agent_data.get("agent_id")}
 ```
 
 **ElevenLabs API Call:**
 | Call | Method | Endpoint |
 |------|--------|----------|
-| Create Agent | SDK | `agents.create(name, conversation_config)` |
+| Create Agent | POST | `/v1/convai/agents/create` |
 
 ---
 
@@ -294,22 +304,24 @@ startStorySession()
 # 1. Get the story agent ID we just created
 story_agent_id = session_data["story_agent_id"]
 
-# 2. Get WebRTC token for this agent
-webrtc_response = elevenlabs_client.conversational_ai.conversations.get_webrtc_token(
-    agent_id=story_agent_id
+# 2. Get signed URL for this agent
+token_resp = requests.get(
+    f"{ELEVENLABS_BASE_URL}/convai/conversation/get_signed_url?agent_id={story_agent_id}",
+    headers=elevenlabs_headers()
 )
+token_data = token_resp.json()
 
-# 3. Return token
+# 3. Return signed URL
 return {
     "success": True,
-    "webrtc_config": {"token": webrtc_response.token},
+    "webrtc_config": {"signed_url": token_data.get("signed_url")},
     "agent_id": story_agent_id
 }
 ```
 
 **Frontend then connects to ElevenLabs (same as Phase 2):**
 ```javascript
-connectToElevenLabs(token, onConversationId, 'story-status', 'story-visualizer')
+connectToElevenLabs(signed_url, onConversationId, 'story-status', 'story-visualizer')
 ```
 
 ---
@@ -341,9 +353,11 @@ endStorySession()
 **Backend (server.py) - `/get_story_transcript`:**
 ```python
 # Same pattern as get_intro_transcript
-conversation = elevenlabs_client.conversational_ai.conversations.get(
-    conversation_id=session_data["story_conversation_id"]
+conv_resp = requests.get(
+    f"{ELEVENLABS_BASE_URL}/convai/conversations/{session_data['story_conversation_id']}",
+    headers=elevenlabs_headers()
 )
+conv_data = conv_resp.json()
 # Format and return transcript
 ```
 
@@ -467,8 +481,9 @@ resetSession()
 ```python
 # 1. Delete the dynamically created story agent (cleanup)
 if session_data["story_agent_id"]:
-    elevenlabs_client.conversational_ai.agents.delete(
-        agent_id=session_data["story_agent_id"]
+    requests.delete(
+        f"{ELEVENLABS_BASE_URL}/convai/agents/{session_data['story_agent_id']}",
+        headers=elevenlabs_headers()
     )
 
 # 2. Clear all session data
@@ -486,7 +501,7 @@ return {"success": True, "message": "Session reset"}
 **ElevenLabs API Call:**
 | Call | Method | Endpoint |
 |------|--------|----------|
-| Delete Agent | SDK | `agents.delete(agent_id)` |
+| Delete Agent | DELETE | `/v1/convai/agents/{agent_id}` |
 
 ---
 
@@ -494,29 +509,31 @@ return {"success": True, "message": "Session reset"}
 
 ### Backend Endpoints
 
-| Endpoint | Method | Purpose | ElevenLabs Calls |
-|----------|--------|---------|------------------|
-| `/start_intro` | POST | Get WebRTC token for intro agent | `agents.get`, `conversations.get_webrtc_token` |
+| Endpoint | Method | Purpose | ElevenLabs API Calls |
+|----------|--------|---------|----------------------|
+| `/` | GET | Serve frontend index.html | None |
+| `/<path>` | GET | Serve frontend static files | None |
+| `/start_intro` | POST | Get signed URL for intro agent | GET agents, GET signed_url |
 | `/set_intro_conversation_id` | POST | Store conversation ID | None |
-| `/get_intro_transcript` | GET | Fetch intro transcript | `conversations.get` |
-| `/create_story_agent` | POST | Create personalized story agent | `agents.create` |
-| `/start_story` | POST | Get WebRTC token for story agent | `conversations.get_webrtc_token` |
+| `/get_intro_transcript` | GET | Fetch intro transcript | GET conversations |
+| `/create_story_agent` | POST | Create personalized story agent | POST agents/create |
+| `/start_story` | POST | Get signed URL for story agent | GET signed_url |
 | `/set_story_conversation_id` | POST | Store conversation ID | None |
-| `/get_story_transcript` | GET | Fetch story transcript | `conversations.get` |
+| `/get_story_transcript` | GET | Fetch story transcript | GET conversations |
 | `/metrics` | GET | Compute and return metrics | None (uses Claude) |
-| `/reset` | POST | Clean up and reset session | `agents.delete` |
+| `/reset` | POST | Clean up and reset session | DELETE agents |
 | `/health` | GET | Health check | None |
 
 ### External API Calls
 
-| Service | SDK Method | When Called |
-|---------|------------|-------------|
-| ElevenLabs | `agents.get(agent_id)` | Start intro |
-| ElevenLabs | `agents.create(...)` | Create story agent |
-| ElevenLabs | `agents.delete(agent_id)` | Reset session |
-| ElevenLabs | `conversations.get_webrtc_token(agent_id)` | Start intro, Start story |
-| ElevenLabs | `conversations.get(conversation_id)` | Get transcripts |
-| Anthropic | `messages.create(...)` | Compute metrics |
+| Service | HTTP Method | Endpoint | When Called |
+|---------|-------------|----------|-------------|
+| ElevenLabs | GET | `/v1/convai/agents/{agent_id}` | Start intro (verify agent) |
+| ElevenLabs | POST | `/v1/convai/agents/create` | Create story agent |
+| ElevenLabs | DELETE | `/v1/convai/agents/{agent_id}` | Reset session |
+| ElevenLabs | GET | `/v1/convai/conversation/get_signed_url` | Start intro, Start story |
+| ElevenLabs | GET | `/v1/convai/conversations/{id}` | Get transcripts |
+| Anthropic | POST | `/v1/messages` | Compute metrics |
 
 ---
 
