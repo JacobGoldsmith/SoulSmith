@@ -28,59 +28,35 @@
                 </button>
             </section>
 
-            <!-- Intro Conversation Screen -->
-            <section id="intro-screen" class="screen">
+            <!-- Adventure Screen (Single conversation with agent) -->
+            <section id="adventure-screen" class="screen">
                 <div class="conversation-area">
                     <div class="agent-avatar">
-                        <div class="avatar-circle">🎭</div>
+                        <div class="avatar-circle">📖</div>
                         <span>Story Guide</span>
                     </div>
-                    <div id="intro-status" class="status-indicator">
+                    <div id="adventure-status" class="status-indicator">
                         Connecting...
                     </div>
-                    <div class="voice-visualizer" id="intro-visualizer">
+                    <div class="voice-visualizer" id="adventure-visualizer">
                         <div class="bar"></div>
                         <div class="bar"></div>
                         <div class="bar"></div>
                         <div class="bar"></div>
                         <div class="bar"></div>
                     </div>
-                    <p class="instruction">Tell me about yourself and the adventure you want!</p>
+                    <p class="instruction">Talk with your Story Guide and enjoy your adventure!</p>
                 </div>
-                <button id="btn-end-intro" class="btn btn-secondary">
-                    I'm Done Talking
+                <button id="btn-end-adventure" class="btn btn-secondary">
+                    End Adventure
                 </button>
             </section>
 
             <!-- Transition Screen -->
             <section id="transition-screen" class="screen">
                 <div class="loading-spinner"></div>
-                <h2>Creating Your Story...</h2>
+                <h2 id="transition-title">Processing...</h2>
                 <p id="transition-message">The magic is happening!</p>
-            </section>
-
-            <!-- Story Screen -->
-            <section id="story-screen" class="screen">
-                <div class="conversation-area">
-                    <div class="agent-avatar">
-                        <div class="avatar-circle">📖</div>
-                        <span>Storyteller</span>
-                    </div>
-                    <div id="story-status" class="status-indicator">
-                        Connecting...
-                    </div>
-                    <div class="voice-visualizer" id="story-visualizer">
-                        <div class="bar"></div>
-                        <div class="bar"></div>
-                        <div class="bar"></div>
-                        <div class="bar"></div>
-                        <div class="bar"></div>
-                    </div>
-                    <p class="instruction">Listen to your magical story!</p>
-                </div>
-                <button id="btn-end-story" class="btn btn-secondary">
-                    End Story
-                </button>
             </section>
 
             <!-- Parent Summary Screen -->
