@@ -4,9 +4,14 @@ A local hackathon prototype for interactive children's story experiences.
 Uses Flask to orchestrate ElevenLabs agent + WebRTC + transcript calls.
 """
 
+import os
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from story_processing import compute_metrics, build_story_prompt
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -20,9 +25,9 @@ session_data = {
     "story_transcript": None,
 }
 
-# Configuration - Set these in environment variables
-ELEVENLABS_API_KEY = "YOUR_ELEVENLABS_API_KEY"
-INTRO_AGENT_ID = "YOUR_INTRO_AGENT_ID"  # Manually created on ElevenLabs website
+# Configuration - Loaded from .env file
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+INTRO_AGENT_ID = os.getenv("INTRO_AGENT_ID")
 
 
 @app.route("/start_intro", methods=["POST"])
