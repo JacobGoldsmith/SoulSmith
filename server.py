@@ -28,6 +28,7 @@ session_data = {
 # Configuration - Loaded from .env file
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 INTRO_AGENT_ID = os.getenv("INTRO_AGENT_ID")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 
 @app.route("/start_intro", methods=["POST"])
