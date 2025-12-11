@@ -5,6 +5,7 @@
 
 // Configuration
 const API_BASE_URL = 'http://localhost:5000';
+const ELEVENLABS_WS_URL = 'wss://api.elevenlabs.io/v1/convai/conversation';
 
 // State management
 const state = {
@@ -15,9 +16,12 @@ const state = {
     introTranscript: null,
     storyTranscript: null,
     metrics: null,
-    // WebRTC state
-    peerConnection: null,
-    dataChannel: null,
+    // WebSocket/Audio state
+    websocket: null,
+    mediaStream: null,
+    audioContext: null,
+    mediaRecorder: null,
+    isRecording: false,
 };
 
 // DOM Elements
@@ -84,6 +88,194 @@ async function apiCall(endpoint, method = 'GET', body = null) {
 }
 
 // ============================================
+// ELEVENLABS WEBRTC CONNECTION
+// ============================================
+
+async function connectToElevenLabs(token, onConversationId, statusElementId, visualizerId) {
+    return new Promise(async (resolve, reject) => {
+        try {
+            // Request microphone access
+            state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    sampleRate: 16000,
+                    channelCount: 1,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                }
+            });
+
+            // Set up audio context for processing
+            state.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: 16000
+            });
+
+            // Connect to ElevenLabs WebSocket
+            const wsUrl = `${ELEVENLABS_WS_URL}?token=${token}`;
+            state.websocket = new WebSocket(wsUrl);
+
+            state.websocket.onopen = () => {
+                console.log('WebSocket connected to ElevenLabs');
+                updateStatus(statusElementId, 'Connected!', 'connected');
+                setVisualizerActive(visualizerId, true);
+
+                // Start sending audio
+                startAudioCapture();
+                resolve();
+            };
+
+            state.websocket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleElevenLabsMessage(data, onConversationId);
+            };
+
+            state.websocket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateStatus(statusElementId, 'Connection error', 'error');
+                reject(error);
+            };
+
+            state.websocket.onclose = (event) => {
+                console.log('WebSocket closed:', event.code, event.reason);
+                stopAudioCapture();
+                setVisualizerActive(visualizerId, false);
+            };
+
+        } catch (error) {
+            console.error('Error connecting to ElevenLabs:', error);
+            updateStatus(statusElementId, 'Microphone access denied', 'error');
+            reject(error);
+        }
+    });
+}
+
+function handleElevenLabsMessage(data, onConversationId) {
+    console.log('ElevenLabs message:', data.type);
+
+    switch (data.type) {
+        case 'conversation_initiation_metadata':
+            // Received conversation ID
+            if (data.conversation_id && onConversationId) {
+                onConversationId(data.conversation_id);
+            }
+            break;
+
+        case 'audio':
+            // Received audio from agent - play it
+            if (data.audio) {
+                playAudioChunk(data.audio);
+            }
+            break;
+
+        case 'transcript':
+            // Received transcript update
+            console.log('Transcript:', data.text);
+            break;
+
+        case 'agent_response':
+            // Agent finished speaking
+            console.log('Agent said:', data.text);
+            break;
+
+        case 'user_transcript':
+            // User speech transcribed
+            console.log('User said:', data.text);
+            break;
+
+        case 'interruption':
+            // User interrupted agent
+            console.log('Conversation interrupted');
+            break;
+
+        case 'error':
+            console.error('ElevenLabs error:', data.message);
+            break;
+
+        default:
+            console.log('Unknown message type:', data.type);
+    }
+}
+
+function startAudioCapture() {
+    if (!state.mediaStream || !state.websocket) return;
+
+    const source = state.audioContext.createMediaStreamSource(state.mediaStream);
+    const processor = state.audioContext.createScriptProcessor(4096, 1, 1);
+
+    processor.onaudioprocess = (event) => {
+        if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
+            const inputData = event.inputBuffer.getChannelData(0);
+
+            // Convert float32 to int16
+            const int16Data = new Int16Array(inputData.length);
+            for (let i = 0; i < inputData.length; i++) {
+                int16Data[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+            }
+
+            // Send audio data as base64
+            const base64Audio = btoa(String.fromCharCode(...new Uint8Array(int16Data.buffer)));
+            state.websocket.send(JSON.stringify({
+                type: 'audio',
+                audio: base64Audio
+            }));
+        }
+    };
+
+    source.connect(processor);
+    processor.connect(state.audioContext.destination);
+    state.isRecording = true;
+    console.log('Audio capture started');
+}
+
+function stopAudioCapture() {
+    state.isRecording = false;
+
+    if (state.mediaStream) {
+        state.mediaStream.getTracks().forEach(track => track.stop());
+        state.mediaStream = null;
+    }
+
+    if (state.audioContext && state.audioContext.state !== 'closed') {
+        state.audioContext.close();
+        state.audioContext = null;
+    }
+
+    console.log('Audio capture stopped');
+}
+
+function playAudioChunk(base64Audio) {
+    // Decode base64 audio and play it
+    const audioData = atob(base64Audio);
+    const arrayBuffer = new ArrayBuffer(audioData.length);
+    const view = new Uint8Array(arrayBuffer);
+
+    for (let i = 0; i < audioData.length; i++) {
+        view[i] = audioData.charCodeAt(i);
+    }
+
+    // Create audio context for playback if needed
+    const playbackContext = new (window.AudioContext || window.webkitAudioContext)();
+
+    playbackContext.decodeAudioData(arrayBuffer)
+        .then(audioBuffer => {
+            const source = playbackContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(playbackContext.destination);
+            source.start();
+        })
+        .catch(err => {
+            console.error('Error playing audio:', err);
+        });
+}
+
+function disconnectFromElevenLabs() {
+    if (state.websocket) {
+        state.websocket.close();
+        state.websocket = null;
+    }
+    stopAudioCapture();
+}
+
+// ============================================
 // INTRO SESSION FUNCTIONS
 // ============================================
 
@@ -93,7 +285,7 @@ async function startIntroSession() {
     updateStatus('intro-status', 'Connecting...', '');
 
     try {
-        // Call backend to get WebRTC config
+        // Call backend to get WebRTC token
         const response = await apiCall('/start_intro', 'POST');
 
         if (!response.success) {
@@ -101,42 +293,18 @@ async function startIntroSession() {
         }
 
         const { webrtc_config, agent_id } = response;
-        state.introConversationId = webrtc_config.conversation_id;
 
-        // TODO: Connect to ElevenLabs WebRTC using config from backend
-        // The WebRTC connection would be established here using the signed_url
-        //
-        // Example WebRTC setup (to be implemented):
-        //
-        // const pc = new RTCPeerConnection();
-        // state.peerConnection = pc;
-        //
-        // // Get user media (microphone)
-        // const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        // stream.getTracks().forEach(track => pc.addTrack(track, stream));
-        //
-        // // Connect to ElevenLabs WebSocket
-        // const ws = new WebSocket(webrtc_config.signed_url);
-        //
-        // ws.onopen = () => {
-        //     console.log('WebSocket connected');
-        //     updateStatus('intro-status', 'Connected!', 'connected');
-        //     setVisualizerActive('intro-visualizer', true);
-        // };
-        //
-        // ws.onmessage = (event) => {
-        //     // Handle incoming audio/messages from agent
-        //     const data = JSON.parse(event.data);
-        //     handleAgentMessage(data);
-        // };
-        //
-        // // Handle ICE candidates, SDP exchange, etc.
-
-        // For now, simulate connection
-        setTimeout(() => {
-            updateStatus('intro-status', 'Connected!', 'connected');
-            setVisualizerActive('intro-visualizer', true);
-        }, 1000);
+        // Connect to ElevenLabs
+        await connectToElevenLabs(
+            webrtc_config.token,
+            (conversationId) => {
+                // Store conversation ID when received
+                state.introConversationId = conversationId;
+                apiCall('/set_intro_conversation_id', 'POST', { conversation_id: conversationId });
+            },
+            'intro-status',
+            'intro-visualizer'
+        );
 
         console.log('Intro session started with agent:', agent_id);
 
@@ -169,11 +337,8 @@ async function getIntroTranscript() {
 async function endIntroSession() {
     console.log('Ending intro session...');
 
-    // TODO: Close WebRTC connection
-    // if (state.peerConnection) {
-    //     state.peerConnection.close();
-    //     state.peerConnection = null;
-    // }
+    // Close WebSocket connection
+    disconnectFromElevenLabs();
 
     setVisualizerActive('intro-visualizer', false);
     updateStatus('intro-status', 'Session ended', '');
@@ -183,6 +348,9 @@ async function endIntroSession() {
     document.getElementById('transition-message').textContent = 'Getting your responses...';
 
     try {
+        // Wait a moment for transcript to be ready
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
         // Get the transcript
         await getIntroTranscript();
 
@@ -243,38 +411,18 @@ async function startStorySession() {
         }
 
         const { webrtc_config, agent_id } = response;
-        state.storyConversationId = webrtc_config.conversation_id;
 
-        // TODO: Connect to ElevenLabs WebRTC using config from backend
-        // Similar to intro session setup:
-        //
-        // const pc = new RTCPeerConnection();
-        // state.peerConnection = pc;
-        //
-        // // For story, we primarily receive audio (agent speaks)
-        // // but child can still interact
-        // const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        // stream.getTracks().forEach(track => pc.addTrack(track, stream));
-        //
-        // const ws = new WebSocket(webrtc_config.signed_url);
-        //
-        // ws.onopen = () => {
-        //     updateStatus('story-status', 'Story starting...', 'connected');
-        //     setVisualizerActive('story-visualizer', true);
-        // };
-        //
-        // // Set up audio playback for agent voice
-        // pc.ontrack = (event) => {
-        //     const audio = new Audio();
-        //     audio.srcObject = event.streams[0];
-        //     audio.play();
-        // };
-
-        // Simulate connection for now
-        setTimeout(() => {
-            updateStatus('story-status', 'Story in progress...', 'connected');
-            setVisualizerActive('story-visualizer', true);
-        }, 1000);
+        // Connect to ElevenLabs
+        await connectToElevenLabs(
+            webrtc_config.token,
+            (conversationId) => {
+                // Store conversation ID when received
+                state.storyConversationId = conversationId;
+                apiCall('/set_story_conversation_id', 'POST', { conversation_id: conversationId });
+            },
+            'story-status',
+            'story-visualizer'
+        );
 
         console.log('Story session started with agent:', agent_id);
 
@@ -307,11 +455,8 @@ async function getStoryTranscript() {
 async function endStorySession() {
     console.log('Ending story session...');
 
-    // TODO: Close WebRTC connection
-    // if (state.peerConnection) {
-    //     state.peerConnection.close();
-    //     state.peerConnection = null;
-    // }
+    // Close WebSocket connection
+    disconnectFromElevenLabs();
 
     setVisualizerActive('story-visualizer', false);
     updateStatus('story-status', 'Story ended', '');
@@ -321,6 +466,9 @@ async function endStorySession() {
     document.getElementById('transition-message').textContent = 'Analyzing the adventure...';
 
     try {
+        // Wait a moment for transcript to be ready
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
         // Get transcript
         await getStoryTranscript();
 
@@ -424,6 +572,9 @@ function renderMetricsError() {
 async function resetSession() {
     console.log('Resetting session...');
 
+    // Close any open connections
+    disconnectFromElevenLabs();
+
     try {
         await apiCall('/reset', 'POST');
     } catch (error) {
@@ -437,12 +588,6 @@ async function resetSession() {
     state.introTranscript = null;
     state.storyTranscript = null;
     state.metrics = null;
-
-    // Close any open connections
-    if (state.peerConnection) {
-        state.peerConnection.close();
-        state.peerConnection = null;
-    }
 
     // Return to welcome screen
     showScreen('welcome');
@@ -475,25 +620,3 @@ document.addEventListener('DOMContentLoaded', () => {
         resetSession();
     });
 });
-
-// ============================================
-// UTILITY FUNCTIONS
-// ============================================
-
-// Helper to handle agent messages during WebRTC session
-function handleAgentMessage(data) {
-    // TODO: Implement message handling based on ElevenLabs WebRTC protocol
-    // This would handle:
-    // - Audio chunks from agent
-    // - Transcript updates
-    // - Conversation state changes
-    console.log('Agent message:', data);
-}
-
-// Helper to send audio to agent
-function sendAudioToAgent(audioData) {
-    // TODO: Send audio through WebRTC data channel
-    // if (state.dataChannel && state.dataChannel.readyState === 'open') {
-    //     state.dataChannel.send(audioData);
-    // }
-}
