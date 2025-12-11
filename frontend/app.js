@@ -4,7 +4,7 @@
  */
 
 // Configuration
-const API_BASE_URL = 'http://localhost:5000';
+const API_BASE_URL = '';  // Same origin - no CORS needed
 const ELEVENLABS_WS_URL = 'wss://api.elevenlabs.io/v1/convai/conversation';
 
 // State management
@@ -91,7 +91,7 @@ async function apiCall(endpoint, method = 'GET', body = null) {
 // ELEVENLABS WEBRTC CONNECTION
 // ============================================
 
-async function connectToElevenLabs(token, onConversationId, statusElementId, visualizerId) {
+async function connectToElevenLabs(signedUrl, onConversationId, statusElementId, visualizerId) {
     return new Promise(async (resolve, reject) => {
         try {
             // Request microphone access
@@ -109,9 +109,8 @@ async function connectToElevenLabs(token, onConversationId, statusElementId, vis
                 sampleRate: 16000
             });
 
-            // Connect to ElevenLabs WebSocket
-            const wsUrl = `${ELEVENLABS_WS_URL}?token=${token}`;
-            state.websocket = new WebSocket(wsUrl);
+            // Connect to ElevenLabs WebSocket using signed URL
+            state.websocket = new WebSocket(signedUrl);
 
             state.websocket.onopen = () => {
                 console.log('WebSocket connected to ElevenLabs');
@@ -296,7 +295,7 @@ async function startIntroSession() {
 
         // Connect to ElevenLabs
         await connectToElevenLabs(
-            webrtc_config.token,
+            webrtc_config.signed_url,
             (conversationId) => {
                 // Store conversation ID when received
                 state.introConversationId = conversationId;
@@ -414,7 +413,7 @@ async function startStorySession() {
 
         // Connect to ElevenLabs
         await connectToElevenLabs(
-            webrtc_config.token,
+            webrtc_config.signed_url,
             (conversationId) => {
                 // Store conversation ID when received
                 state.storyConversationId = conversationId;
