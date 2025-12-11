@@ -7,6 +7,178 @@
 const API_BASE_URL = '';  // Same origin - no CORS needed
 const ELEVENLABS_WS_URL = 'wss://api.elevenlabs.io/v1/convai/conversation';
 
+// Debug logging helper
+const DEBUG = true;
+const SAVE_AUDIO_FILES = true;  // Save audio to Downloads folder
+let audioFileCounter = 0;
+
+// Audio recording buffers - collect all audio during session
+let sentAudioChunks = [];      // Audio we send to ElevenLabs
+let receivedAudioChunks = [];  // Audio we receive from ElevenLabs
+
+function log(category, message, data = null) {
+    if (!DEBUG) return;
+    const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+    const prefix = `[${timestamp}] [${category}]`;
+    if (data) {
+        console.log(`${prefix} ${message}`, data);
+    } else {
+        console.log(`${prefix} ${message}`);
+    }
+}
+
+// Save audio data to a downloadable file
+function saveAudioFile(audioData, prefix) {
+    if (!SAVE_AUDIO_FILES) return;
+
+    audioFileCounter++;
+    const filename = `${prefix}_${audioFileCounter}_${Date.now()}.raw`;
+
+    let blob;
+    if (audioData instanceof ArrayBuffer) {
+        blob = new Blob([audioData], { type: 'application/octet-stream' });
+    } else if (typeof audioData === 'string') {
+        // Base64 string - decode first
+        const binaryString = atob(audioData);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        blob = new Blob([bytes], { type: 'application/octet-stream' });
+    } else {
+        blob = new Blob([audioData], { type: 'application/octet-stream' });
+    }
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    log('FILE', `💾 Saved: ${filename} (${blob.size} bytes)`);
+}
+
+// Create WAV file from PCM data (16-bit, 16kHz, mono)
+function createWavFile(pcmData) {
+    const sampleRate = 16000;
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+    const blockAlign = numChannels * bitsPerSample / 8;
+    const dataSize = pcmData.byteLength;
+    const fileSize = 44 + dataSize;
+
+    const buffer = new ArrayBuffer(fileSize);
+    const view = new DataView(buffer);
+
+    // WAV header
+    // "RIFF" chunk descriptor
+    view.setUint8(0, 'R'.charCodeAt(0));
+    view.setUint8(1, 'I'.charCodeAt(0));
+    view.setUint8(2, 'F'.charCodeAt(0));
+    view.setUint8(3, 'F'.charCodeAt(0));
+    view.setUint32(4, fileSize - 8, true);  // File size - 8
+    view.setUint8(8, 'W'.charCodeAt(0));
+    view.setUint8(9, 'A'.charCodeAt(0));
+    view.setUint8(10, 'V'.charCodeAt(0));
+    view.setUint8(11, 'E'.charCodeAt(0));
+
+    // "fmt " sub-chunk
+    view.setUint8(12, 'f'.charCodeAt(0));
+    view.setUint8(13, 'm'.charCodeAt(0));
+    view.setUint8(14, 't'.charCodeAt(0));
+    view.setUint8(15, ' '.charCodeAt(0));
+    view.setUint32(16, 16, true);           // Subchunk1Size (16 for PCM)
+    view.setUint16(20, 1, true);            // AudioFormat (1 for PCM)
+    view.setUint16(22, numChannels, true);  // NumChannels
+    view.setUint32(24, sampleRate, true);   // SampleRate
+    view.setUint32(28, byteRate, true);     // ByteRate
+    view.setUint16(32, blockAlign, true);   // BlockAlign
+    view.setUint16(34, bitsPerSample, true);// BitsPerSample
+
+    // "data" sub-chunk
+    view.setUint8(36, 'd'.charCodeAt(0));
+    view.setUint8(37, 'a'.charCodeAt(0));
+    view.setUint8(38, 't'.charCodeAt(0));
+    view.setUint8(39, 'a'.charCodeAt(0));
+    view.setUint32(40, dataSize, true);     // Subchunk2Size
+
+    // Copy PCM data
+    const wavData = new Uint8Array(buffer);
+    wavData.set(new Uint8Array(pcmData), 44);
+
+    return buffer;
+}
+
+// Save all accumulated audio from a session
+function saveSessionAudio(sessionName) {
+    if (!SAVE_AUDIO_FILES) return;
+
+    const timestamp = Date.now();
+
+    // Save sent audio (what user said)
+    if (sentAudioChunks.length > 0) {
+        const totalSize = sentAudioChunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+        const combined = new Uint8Array(totalSize);
+        let offset = 0;
+        for (const chunk of sentAudioChunks) {
+            combined.set(new Uint8Array(chunk), offset);
+            offset += chunk.byteLength;
+        }
+        const wavData = createWavFile(combined.buffer);
+        const blob = new Blob([wavData], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${sessionName}_SENT_${timestamp}.wav`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        log('FILE', `💾 Saved SENT audio: ${sentAudioChunks.length} chunks, ${totalSize} bytes → WAV`);
+    } else {
+        log('FILE', '⚠️ No sent audio to save');
+    }
+
+    // Save received audio (what agent said)
+    if (receivedAudioChunks.length > 0) {
+        const totalSize = receivedAudioChunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+        const combined = new Uint8Array(totalSize);
+        let offset = 0;
+        for (const chunk of receivedAudioChunks) {
+            combined.set(new Uint8Array(chunk), offset);
+            offset += chunk.byteLength;
+        }
+        const wavData = createWavFile(combined.buffer);
+        const blob = new Blob([wavData], { type: 'audio/wav' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${sessionName}_RECEIVED_${timestamp}.wav`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        log('FILE', `💾 Saved RECEIVED audio: ${receivedAudioChunks.length} chunks, ${totalSize} bytes → WAV`);
+    } else {
+        log('FILE', '⚠️ No received audio to save (agent did not speak)');
+    }
+
+    // Clear buffers for next session
+    sentAudioChunks = [];
+    receivedAudioChunks = [];
+}
+
+// Clear audio buffers when starting a new session
+function clearAudioBuffers() {
+    sentAudioChunks = [];
+    receivedAudioChunks = [];
+    log('FILE', '🗑️ Audio buffers cleared');
+}
+
 // State management
 const state = {
     currentScreen: 'welcome',
@@ -73,6 +245,8 @@ function setVisualizerActive(visualizerId, active) {
 
 // API Functions
 async function apiCall(endpoint, method = 'GET', body = null) {
+    log('API', `📡 ${method} ${endpoint}`, body);
+
     const options = {
         method,
         headers: {
@@ -84,7 +258,9 @@ async function apiCall(endpoint, method = 'GET', body = null) {
     }
 
     const response = await fetch(`${API_BASE_URL}${endpoint}`, options);
-    return response.json();
+    const data = await response.json();
+    log('API', `📥 Response from ${endpoint}:`, data);
+    return data;
 }
 
 // ============================================
@@ -94,6 +270,8 @@ async function apiCall(endpoint, method = 'GET', body = null) {
 async function connectToElevenLabs(signedUrl, onConversationId, statusElementId, visualizerId) {
     return new Promise(async (resolve, reject) => {
         try {
+            log('MIC', '📍 Requesting microphone access...');
+
             // Request microphone access
             state.mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
@@ -104,16 +282,21 @@ async function connectToElevenLabs(signedUrl, onConversationId, statusElementId,
                 }
             });
 
+            log('MIC', '✅ Microphone access granted');
+
             // Set up audio context for processing
             state.audioContext = new (window.AudioContext || window.webkitAudioContext)({
                 sampleRate: 16000
             });
+            log('AUDIO', '✅ AudioContext created at 16kHz');
 
             // Connect to ElevenLabs WebSocket using signed URL
+            log('WS', '📍 Connecting to ElevenLabs WebSocket...');
+            log('WS', 'URL:', signedUrl.substring(0, 100) + '...');
             state.websocket = new WebSocket(signedUrl);
 
             state.websocket.onopen = () => {
-                console.log('WebSocket connected to ElevenLabs');
+                log('WS', '✅ WebSocket CONNECTED to ElevenLabs');
                 updateStatus(statusElementId, 'Connected!', 'connected');
                 setVisualizerActive(visualizerId, true);
 
@@ -122,25 +305,44 @@ async function connectToElevenLabs(signedUrl, onConversationId, statusElementId,
                 resolve();
             };
 
-            state.websocket.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                handleElevenLabsMessage(data, onConversationId);
+            state.websocket.onmessage = async (event) => {
+                // Handle binary audio data
+                if (event.data instanceof Blob) {
+                    log('WS-IN', `🔊 Received BINARY audio: ${event.data.size} bytes`);
+                    const arrayBuffer = await event.data.arrayBuffer();
+                    // Store for later saving
+                    receivedAudioChunks.push(arrayBuffer.slice(0));
+                    playAudioBuffer(arrayBuffer);
+                    return;
+                }
+
+                // Handle JSON messages
+                try {
+                    const data = JSON.parse(event.data);
+                    log('WS-IN', `📨 Received: ${data.type}`, data);
+                    handleElevenLabsMessage(data, onConversationId);
+                } catch (e) {
+                    log('WS-IN', '⚠️ Non-JSON message:', event.data);
+                }
             };
 
             state.websocket.onerror = (error) => {
-                console.error('WebSocket error:', error);
+                log('WS', '❌ WebSocket ERROR:', error);
                 updateStatus(statusElementId, 'Connection error', 'error');
                 reject(error);
             };
 
             state.websocket.onclose = (event) => {
-                console.log('WebSocket closed:', event.code, event.reason);
+                log('WS', `🔌 WebSocket CLOSED: code=${event.code}, reason=${event.reason}`);
+                log('WS', `Close event details: wasClean=${event.wasClean}`);
+                // Log stack trace to see what triggered the close
+                console.trace('WebSocket close triggered from:');
                 stopAudioCapture();
                 setVisualizerActive(visualizerId, false);
             };
 
         } catch (error) {
-            console.error('Error connecting to ElevenLabs:', error);
+            log('MIC', '❌ Microphone access DENIED:', error);
             updateStatus(statusElementId, 'Microphone access denied', 'error');
             reject(error);
         }
@@ -152,32 +354,46 @@ function handleElevenLabsMessage(data, onConversationId) {
 
     switch (data.type) {
         case 'conversation_initiation_metadata':
-            // Received conversation ID
-            if (data.conversation_id && onConversationId) {
-                onConversationId(data.conversation_id);
+            // Received conversation ID (nested in conversation_initiation_metadata_event)
+            const convId = data.conversation_initiation_metadata_event?.conversation_id || data.conversation_id;
+            if (convId && onConversationId) {
+                console.log('Conversation ID:', convId);
+                onConversationId(convId);
             }
             break;
 
         case 'audio':
-            // Received audio from agent - play it
-            if (data.audio) {
-                playAudioChunk(data.audio);
+            // Received audio from agent - play it (data is in audio_event)
+            log('WS-IN', '🎵 Audio event received:', data.audio_event);
+            const audioData = data.audio_event?.audio_base_64 || data.audio_event?.audio || data.audio;
+            if (audioData) {
+                log('WS-IN', `Playing audio chunk, length: ${audioData.length}`);
+                // Decode and store for later saving
+                const binaryString = atob(audioData);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                receivedAudioChunks.push(bytes.buffer);
+                playAudioChunk(audioData);
+            } else {
+                log('WS-IN', '⚠️ No audio data found in:', Object.keys(data.audio_event || {}));
             }
             break;
 
         case 'transcript':
             // Received transcript update
-            console.log('Transcript:', data.text);
+            console.log('Transcript:', data.transcript_event?.text || data.text);
             break;
 
         case 'agent_response':
             // Agent finished speaking
-            console.log('Agent said:', data.text);
+            console.log('Agent said:', data.agent_response_event?.agent_response || data.text);
             break;
 
         case 'user_transcript':
             // User speech transcribed
-            console.log('User said:', data.text);
+            console.log('User said:', data.user_transcription_event?.user_transcript || data.text);
             break;
 
         case 'interruption':
@@ -185,18 +401,28 @@ function handleElevenLabsMessage(data, onConversationId) {
             console.log('Conversation interrupted');
             break;
 
+        case 'ping':
+            // Ping from server - ignore
+            break;
+
         case 'error':
-            console.error('ElevenLabs error:', data.message);
+            console.error('ElevenLabs error:', data.error_event?.message || data.message);
             break;
 
         default:
-            console.log('Unknown message type:', data.type);
+            console.log('Unknown message type:', data.type, data);
     }
 }
 
-function startAudioCapture() {
-    if (!state.mediaStream || !state.websocket) return;
+let audioChunksSent = 0;
 
+function startAudioCapture() {
+    if (!state.mediaStream || !state.websocket) {
+        log('MIC', '❌ Cannot start capture - missing mediaStream or websocket');
+        return;
+    }
+
+    audioChunksSent = 0;
     const source = state.audioContext.createMediaStreamSource(state.mediaStream);
     const processor = state.audioContext.createScriptProcessor(4096, 1, 1);
 
@@ -204,25 +430,40 @@ function startAudioCapture() {
         if (state.websocket && state.websocket.readyState === WebSocket.OPEN) {
             const inputData = event.inputBuffer.getChannelData(0);
 
+            // Check if there's actual audio (not silence)
+            const maxAmplitude = Math.max(...inputData.map(Math.abs));
+
             // Convert float32 to int16
             const int16Data = new Int16Array(inputData.length);
             for (let i = 0; i < inputData.length; i++) {
                 int16Data[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
             }
 
-            // Send audio data as base64
+            // Send audio data as base64 (ElevenLabs format)
             const base64Audio = btoa(String.fromCharCode(...new Uint8Array(int16Data.buffer)));
             state.websocket.send(JSON.stringify({
-                type: 'audio',
-                audio: base64Audio
+                user_audio_chunk: base64Audio
             }));
+
+            // Store chunk for later saving
+            sentAudioChunks.push(int16Data.buffer.slice(0));
+
+            audioChunksSent++;
+            // Log every 50 chunks (~3 seconds) to avoid spam
+            if (audioChunksSent % 50 === 0) {
+                log('WS-OUT', `🎤 Sent ${audioChunksSent} audio chunks (amplitude: ${maxAmplitude.toFixed(3)})`);
+            }
+            // Log first chunk
+            if (audioChunksSent === 1) {
+                log('WS-OUT', `🎤 First audio chunk sent (${base64Audio.length} chars, amplitude: ${maxAmplitude.toFixed(3)})`);
+            }
         }
     };
 
     source.connect(processor);
     processor.connect(state.audioContext.destination);
     state.isRecording = true;
-    console.log('Audio capture started');
+    log('MIC', '✅ Audio capture STARTED - now sending audio to ElevenLabs');
 }
 
 function stopAudioCapture() {
@@ -241,7 +482,75 @@ function stopAudioCapture() {
     console.log('Audio capture stopped');
 }
 
+// Audio playback queue and context
+let playbackContext = null;
+let audioQueue = [];
+let isPlaying = false;
+
+function getPlaybackContext() {
+    if (!playbackContext || playbackContext.state === 'closed') {
+        playbackContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 16000
+        });
+    }
+    return playbackContext;
+}
+
+async function playAudioBuffer(arrayBuffer) {
+    log('PLAY', `🔊 Processing audio buffer: ${arrayBuffer.byteLength} bytes`);
+
+    // ElevenLabs sends PCM 16-bit audio at 16kHz
+    const ctx = getPlaybackContext();
+
+    // Convert ArrayBuffer to Int16Array (PCM data)
+    const int16Data = new Int16Array(arrayBuffer);
+    log('PLAY', `Converted to Int16Array: ${int16Data.length} samples`);
+
+    // Convert Int16 to Float32 for Web Audio API
+    const float32Data = new Float32Array(int16Data.length);
+    for (let i = 0; i < int16Data.length; i++) {
+        float32Data[i] = int16Data[i] / 32768.0;
+    }
+
+    // Create audio buffer
+    const audioBuffer = ctx.createBuffer(1, float32Data.length, 16000);
+    audioBuffer.getChannelData(0).set(float32Data);
+
+    // Queue the audio
+    audioQueue.push(audioBuffer);
+    log('PLAY', `Queued audio. Queue length: ${audioQueue.length}, isPlaying: ${isPlaying}`);
+
+    // Play if not already playing
+    if (!isPlaying) {
+        playNextInQueue();
+    }
+}
+
+function playNextInQueue() {
+    if (audioQueue.length === 0) {
+        isPlaying = false;
+        log('PLAY', '📭 Queue empty, stopping playback');
+        return;
+    }
+
+    isPlaying = true;
+    const ctx = getPlaybackContext();
+    const audioBuffer = audioQueue.shift();
+
+    log('PLAY', `▶️ Playing audio: ${audioBuffer.duration.toFixed(2)}s, ${audioQueue.length} remaining in queue`);
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    source.onended = () => {
+        playNextInQueue();
+    };
+    source.start();
+}
+
 function playAudioChunk(base64Audio) {
+    log('PLAY', `🎵 Decoding base64 audio chunk: ${base64Audio.length} chars`);
+
     // Decode base64 audio and play it
     const audioData = atob(base64Audio);
     const arrayBuffer = new ArrayBuffer(audioData.length);
@@ -251,19 +560,9 @@ function playAudioChunk(base64Audio) {
         view[i] = audioData.charCodeAt(i);
     }
 
-    // Create audio context for playback if needed
-    const playbackContext = new (window.AudioContext || window.webkitAudioContext)();
-
-    playbackContext.decodeAudioData(arrayBuffer)
-        .then(audioBuffer => {
-            const source = playbackContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(playbackContext.destination);
-            source.start();
-        })
-        .catch(err => {
-            console.error('Error playing audio:', err);
-        });
+    log('PLAY', `Decoded to ${arrayBuffer.byteLength} bytes, sending to playAudioBuffer`);
+    // Use the same playback system
+    playAudioBuffer(arrayBuffer);
 }
 
 function disconnectFromElevenLabs() {
@@ -279,7 +578,8 @@ function disconnectFromElevenLabs() {
 // ============================================
 
 async function startIntroSession() {
-    console.log('Starting intro session...');
+    log('SESSION', '🚀 ========== STARTING INTRO SESSION ==========');
+    clearAudioBuffers();  // Clear any previous audio
     showScreen('intro');
     updateStatus('intro-status', 'Connecting...', '');
 
@@ -292,12 +592,14 @@ async function startIntroSession() {
         }
 
         const { webrtc_config, agent_id } = response;
+        log('SESSION', `Got signed URL for agent: ${agent_id}`);
 
         // Connect to ElevenLabs
         await connectToElevenLabs(
             webrtc_config.signed_url,
             (conversationId) => {
                 // Store conversation ID when received
+                log('SESSION', `Received conversation ID: ${conversationId}`);
                 state.introConversationId = conversationId;
                 apiCall('/set_intro_conversation_id', 'POST', { conversation_id: conversationId });
             },
@@ -305,10 +607,12 @@ async function startIntroSession() {
             'intro-visualizer'
         );
 
-        console.log('Intro session started with agent:', agent_id);
+        log('SESSION', `✅ Intro session READY - agent: ${agent_id}`);
+        log('SESSION', '💡 The agent should now speak its first_message (if configured)');
+        log('SESSION', '💡 Speak into your microphone - audio is being sent to ElevenLabs');
 
     } catch (error) {
-        console.error('Error starting intro session:', error);
+        log('SESSION', '❌ Error starting intro session:', error);
         updateStatus('intro-status', 'Connection failed', 'error');
     }
 }
@@ -334,7 +638,10 @@ async function getIntroTranscript() {
 }
 
 async function endIntroSession() {
-    console.log('Ending intro session...');
+    log('SESSION', '🛑 ========== ENDING INTRO SESSION ==========');
+
+    // Save audio files before disconnecting
+    saveSessionAudio('INTRO');
 
     // Close WebSocket connection
     disconnectFromElevenLabs();
@@ -398,7 +705,8 @@ async function createStoryAgent() {
 }
 
 async function startStorySession() {
-    console.log('Starting story session...');
+    log('SESSION', '🚀 ========== STARTING STORY SESSION ==========');
+    clearAudioBuffers();  // Clear any previous audio
     showScreen('story');
     updateStatus('story-status', 'Connecting...', '');
 
@@ -410,12 +718,14 @@ async function startStorySession() {
         }
 
         const { webrtc_config, agent_id } = response;
+        log('SESSION', `Got signed URL for story agent: ${agent_id}`);
 
         // Connect to ElevenLabs
         await connectToElevenLabs(
             webrtc_config.signed_url,
             (conversationId) => {
                 // Store conversation ID when received
+                log('SESSION', `Received story conversation ID: ${conversationId}`);
                 state.storyConversationId = conversationId;
                 apiCall('/set_story_conversation_id', 'POST', { conversation_id: conversationId });
             },
@@ -423,10 +733,11 @@ async function startStorySession() {
             'story-visualizer'
         );
 
-        console.log('Story session started with agent:', agent_id);
+        log('SESSION', `✅ Story session READY - agent: ${agent_id}`);
+        log('SESSION', '💡 The storyteller agent should now speak its first_message');
 
     } catch (error) {
-        console.error('Error starting story session:', error);
+        log('SESSION', '❌ Error starting story session:', error);
         updateStatus('story-status', 'Connection failed', 'error');
     }
 }
@@ -452,7 +763,10 @@ async function getStoryTranscript() {
 }
 
 async function endStorySession() {
-    console.log('Ending story session...');
+    log('SESSION', '🛑 ========== ENDING STORY SESSION ==========');
+
+    // Save audio files before disconnecting
+    saveSessionAudio('STORY');
 
     // Close WebSocket connection
     disconnectFromElevenLabs();
@@ -596,8 +910,33 @@ async function resetSession() {
 // EVENT LISTENERS
 // ============================================
 
-document.addEventListener('DOMContentLoaded', () => {
-    console.log('SoulSmith app initialized');
+document.addEventListener('DOMContentLoaded', async () => {
+    log('INIT', '🎮 SoulSmith app initialized');
+
+    // Check agent configurations on startup
+    try {
+        const debugResp = await fetch('/debug/agents');
+        const agents = await debugResp.json();
+        log('INIT', '📋 Agent configurations:', agents);
+
+        if (agents.intro_agent) {
+            if (!agents.intro_agent.first_message) {
+                log('INIT', '⚠️ WARNING: Intro agent has NO first_message - it will wait for user to speak first!');
+            } else {
+                log('INIT', `✅ Intro agent first_message: "${agents.intro_agent.first_message.substring(0, 50)}..."`);
+            }
+        }
+
+        if (agents.adventure_agent) {
+            if (!agents.adventure_agent.first_message) {
+                log('INIT', '⚠️ WARNING: Adventure agent has NO first_message - it will wait for user to speak first!');
+            } else {
+                log('INIT', `✅ Adventure agent first_message: "${agents.adventure_agent.first_message.substring(0, 50)}..."`);
+            }
+        }
+    } catch (e) {
+        log('INIT', '⚠️ Could not check agent configs:', e.message);
+    }
 
     // Start Adventure button
     buttons.startAdventure.addEventListener('click', () => {

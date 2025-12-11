@@ -17,6 +17,7 @@ CORS(app)
 # Configuration
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 INTRO_AGENT_ID = os.getenv("INTRO_AGENT_ID")
+ADVENTURE_AGENT_ID = os.getenv("ADVENTURE_AGENT_ID")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1"
@@ -127,43 +128,20 @@ def get_intro_transcript():
 
 @app.route("/create_story_agent", methods=["POST"])
 def create_story_agent():
+    """Use the pre-configured adventure agent instead of creating a new one."""
     transcript = session_data.get("intro_transcript")
-    if not transcript:
-        return jsonify({"success": False, "error": "No intro transcript found"}), 400
 
-    story_prompt = build_story_prompt(transcript)
+    # Build prompt for logging/debugging purposes
+    story_prompt = build_story_prompt(transcript) if transcript else "No transcript available"
 
-    try:
-        create_resp = requests.post(
-            f"{ELEVENLABS_BASE_URL}/convai/agents/create",
-            headers=elevenlabs_headers(),
-            json={
-                "name": "SoulSmith Story Agent",
-                "conversation_config": {
-                    "agent": {
-                        "prompt": {"prompt": story_prompt},
-                        "first_message": "Once upon a time, in a land not so far away...",
-                        "language": "en"
-                    },
-                    "tts": {"voice_id": DEFAULT_VOICE_ID}
-                }
-            }
-        )
+    # Use the pre-configured adventure agent
+    session_data["story_agent_id"] = ADVENTURE_AGENT_ID
 
-        if create_resp.status_code not in [200, 201]:
-            return jsonify({"success": False, "error": f"Failed to create agent: {create_resp.text}"}), 500
-
-        agent_data = create_resp.json()
-        session_data["story_agent_id"] = agent_data.get("agent_id")
-
-        return jsonify({
-            "success": True,
-            "story_agent_id": agent_data.get("agent_id"),
-            "prompt_preview": story_prompt[:200] + "...",
-        })
-    except Exception as e:
-        print(f"Error creating story agent: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({
+        "success": True,
+        "story_agent_id": ADVENTURE_AGENT_ID,
+        "prompt_preview": story_prompt[:200] + "...",
+    })
 
 
 @app.route("/start_story", methods=["POST"])
@@ -173,6 +151,19 @@ def start_story():
         return jsonify({"success": False, "error": "No story agent created"}), 400
 
     try:
+        # First, verify the agent exists and log its config
+        agent_resp = requests.get(
+            f"{ELEVENLABS_BASE_URL}/convai/agents/{story_agent_id}",
+            headers=elevenlabs_headers()
+        )
+        if agent_resp.status_code == 200:
+            agent_data = agent_resp.json()
+            print(f"Adventure agent found: {agent_data.get('name', 'Unknown')}")
+            print(f"Agent config: {agent_data.get('conversation_config', {})}")
+        else:
+            print(f"Warning: Could not fetch agent info: {agent_resp.status_code} - {agent_resp.text}")
+
+        # Get signed URL
         token_resp = requests.get(
             f"{ELEVENLABS_BASE_URL}/convai/conversation/get_signed_url?agent_id={story_agent_id}",
             headers=elevenlabs_headers()
@@ -182,6 +173,7 @@ def start_story():
             return jsonify({"success": False, "error": f"Failed to get signed URL: {token_resp.text}"}), 500
 
         token_data = token_resp.json()
+        print(f"Got signed URL for agent: {story_agent_id}")
 
         return jsonify({
             "success": True,
@@ -249,16 +241,7 @@ def get_metrics():
 @app.route("/reset", methods=["POST"])
 def reset_session():
     global session_data
-    story_agent_id = session_data.get("story_agent_id")
-    if story_agent_id:
-        try:
-            requests.delete(
-                f"{ELEVENLABS_BASE_URL}/convai/agents/{story_agent_id}",
-                headers=elevenlabs_headers()
-            )
-        except Exception as e:
-            print(f"Error deleting story agent: {e}")
-
+    # No need to delete agents - we're using pre-configured agents now
     session_data = {
         "intro_conversation_id": None,
         "story_agent_id": None,
@@ -274,8 +257,57 @@ def health_check():
     return jsonify({"status": "healthy", "app": "SoulSmith"})
 
 
+@app.route("/debug/agents", methods=["GET"])
+def debug_agents():
+    """Debug endpoint to check agent configurations."""
+    results = {}
+
+    # Check intro agent
+    if INTRO_AGENT_ID:
+        try:
+            resp = requests.get(
+                f"{ELEVENLABS_BASE_URL}/convai/agents/{INTRO_AGENT_ID}",
+                headers=elevenlabs_headers()
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                results["intro_agent"] = {
+                    "id": INTRO_AGENT_ID,
+                    "name": data.get("name"),
+                    "first_message": data.get("conversation_config", {}).get("agent", {}).get("first_message"),
+                    "language": data.get("conversation_config", {}).get("agent", {}).get("language"),
+                }
+            else:
+                results["intro_agent"] = {"error": f"{resp.status_code}: {resp.text}"}
+        except Exception as e:
+            results["intro_agent"] = {"error": str(e)}
+
+    # Check adventure agent
+    if ADVENTURE_AGENT_ID:
+        try:
+            resp = requests.get(
+                f"{ELEVENLABS_BASE_URL}/convai/agents/{ADVENTURE_AGENT_ID}",
+                headers=elevenlabs_headers()
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                results["adventure_agent"] = {
+                    "id": ADVENTURE_AGENT_ID,
+                    "name": data.get("name"),
+                    "first_message": data.get("conversation_config", {}).get("agent", {}).get("first_message"),
+                    "language": data.get("conversation_config", {}).get("agent", {}).get("language"),
+                }
+            else:
+                results["adventure_agent"] = {"error": f"{resp.status_code}: {resp.text}"}
+        except Exception as e:
+            results["adventure_agent"] = {"error": str(e)}
+
+    return jsonify(results)
+
+
 if __name__ == "__main__":
     print("Starting SoulSmith server...")
     print(f"ElevenLabs API Key: {'configured' if ELEVENLABS_API_KEY else 'MISSING'}")
     print(f"Intro Agent ID: {'configured' if INTRO_AGENT_ID else 'MISSING'}")
+    print(f"Adventure Agent ID: {'configured' if ADVENTURE_AGENT_ID else 'MISSING'}")
     app.run(debug=True, host='0.0.0.0', port=5000)
